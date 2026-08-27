@@ -1,0 +1,240 @@
+name: togglemaster-fase2
+
+services:
+  postgres-main:
+    image: postgres:16-alpine
+    container_name: togglemaster-postgres-main
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no arquivo .env}"
+      POSTGRES_DB: postgres
+      SERVICE_API_KEY: "${SERVICE_API_KEY:?Defina SERVICE_API_KEY no arquivo .env}"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_main_data:/var/lib/postgresql/data
+      - ./docker/postgres-main/01-init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+      - ./auth-service/db/init.sql:/tmp/togglemaster-auth-init.sql:ro
+      - ./flag-service/db/init.sql:/tmp/togglemaster-flags-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - togglemaster-net
+
+  postgres-targeting:
+    image: postgres:16-alpine
+    container_name: togglemaster-postgres-targeting
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no arquivo .env}"
+      POSTGRES_DB: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_targeting_data:/var/lib/postgresql/data
+      - ./docker/postgres-targeting/01-init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+      - ./targeting-service/db/init.sql:/tmp/togglemaster-targeting-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - togglemaster-net
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: togglemaster-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - togglemaster-net
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    container_name: togglemaster-dynamodb-local
+    restart: unless-stopped
+    # Modo inMemory evita o erro de permissao SQLite encontrado durante o laboratorio.
+    # A Fase 2 exige o DynamoDB Local como container, nao persistencia local entre recriacoes.
+    command: "-jar DynamoDBLocal.jar -sharedDb -inMemory"
+    ports:
+      - "8000:8000"
+    networks:
+      - togglemaster-net
+
+  auth-service:
+    build:
+      context: ./auth-service
+      dockerfile: Dockerfile
+    image: togglemaster/auth-service:local
+    container_name: togglemaster-auth-service
+    restart: unless-stopped
+    environment:
+      PORT: "8001"
+      DATABASE_URL: "postgres://postgres:${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no arquivo .env}@postgres-main:5432/auth_db?sslmode=disable"
+      MASTER_KEY: "${MASTER_KEY:?Defina MASTER_KEY no arquivo .env}"
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres-main:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8001/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - togglemaster-net
+
+  flag-service:
+    build:
+      context: ./flag-service
+      dockerfile: Dockerfile
+    image: togglemaster/flag-service:local
+    container_name: togglemaster-flag-service
+    restart: unless-stopped
+    environment:
+      PORT: "8002"
+      DATABASE_URL: "postgres://postgres:${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no arquivo .env}@postgres-main:5432/flags_db?sslmode=disable"
+      AUTH_SERVICE_URL: "http://auth-service:8001"
+      GUNICORN_WORKERS: "2"
+      GUNICORN_THREADS: "4"
+    ports:
+      - "8002:8002"
+    depends_on:
+      postgres-main:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - togglemaster-net
+
+  targeting-service:
+    build:
+      context: ./targeting-service
+      dockerfile: Dockerfile
+    image: togglemaster/targeting-service:local
+    container_name: togglemaster-targeting-service
+    restart: unless-stopped
+    environment:
+      PORT: "8003"
+      DATABASE_URL: "postgres://postgres:${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no arquivo .env}@postgres-targeting:5432/targeting_db?sslmode=disable"
+      AUTH_SERVICE_URL: "http://auth-service:8001"
+      GUNICORN_WORKERS: "2"
+      GUNICORN_THREADS: "4"
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres-targeting:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - togglemaster-net
+
+  evaluation-service:
+    build:
+      context: ./evaluation-service
+      dockerfile: Dockerfile
+    image: togglemaster/evaluation-service:local
+    container_name: togglemaster-evaluation-service
+    restart: unless-stopped
+    environment:
+      PORT: "8004"
+      REDIS_URL: "redis://redis:6379"
+      FLAG_SERVICE_URL: "http://flag-service:8002"
+      TARGETING_SERVICE_URL: "http://targeting-service:8003"
+      SERVICE_API_KEY: "${SERVICE_API_KEY:?Defina SERVICE_API_KEY no arquivo .env}"
+      # Nao existe um 10o container de SQS no ambiente local. O fluxo SQS e validado no AWS/EKS.
+      AWS_SQS_URL: ""
+      AWS_REGION: "us-east-1"
+      AWS_DEFAULT_REGION: "us-east-1"
+    ports:
+      - "8004:8004"
+    depends_on:
+      redis:
+        condition: service_healthy
+      flag-service:
+        condition: service_healthy
+      targeting-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8004/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - togglemaster-net
+
+  analytics-service:
+    build:
+      context: ./analytics-service
+      dockerfile: Dockerfile
+    image: togglemaster/analytics-service:local
+    container_name: togglemaster-analytics-service
+    restart: unless-stopped
+    environment:
+      PORT: "8005"
+      AWS_REGION: "us-east-1"
+      AWS_DEFAULT_REGION: "us-east-1"
+      AWS_DYNAMODB_TABLE: "ToggleMasterAnalytics"
+      AWS_DYNAMODB_ENDPOINT: "http://dynamodb-local:8000"
+      AWS_ACCESS_KEY_ID: "${DYNAMODB_LOCAL_ACCESS_KEY_ID:?Defina DYNAMODB_LOCAL_ACCESS_KEY_ID no arquivo .env}"
+      AWS_SECRET_ACCESS_KEY: "${DYNAMODB_LOCAL_SECRET_ACCESS_KEY:?Defina DYNAMODB_LOCAL_SECRET_ACCESS_KEY no arquivo .env}"
+      # Sem SQS local para manter exatamente 9 containers. O worker fica desabilitado de forma limpa.
+      AWS_SQS_URL: ""
+      GUNICORN_WORKERS: "1"
+      GUNICORN_THREADS: "2"
+    ports:
+      - "8005:8005"
+    depends_on:
+      dynamodb-local:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/health', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - togglemaster-net
+
+networks:
+  togglemaster-net:
+    driver: bridge
+
+volumes:
+  postgres_main_data:
+  postgres_targeting_data:
+  redis_data:

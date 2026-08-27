@@ -1,0 +1,26 @@
+# Secrets e credenciais locais
+.env
+.env.*
+!.env.example
+
+# AWS / Kubernetes
+.aws/
+.kube/
+kubeconfig*
+*credentials*
+
+# Chaves e certificados
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Temporarios
+*.log
+*.tmp
+*.zip
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
